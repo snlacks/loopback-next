@@ -102,7 +102,33 @@ function getParserOptions<T extends 'json' | 'urlencoded' | 'text'>(
   return opts as ParserOption<T>;
 }
 
+/**
+ * Interface to be implemented by body parser extensions
+ */
+export interface BodyParser {
+  /**
+   * Optional name of the parser for debugging
+   */
+  name?: string;
+  /**
+   * Indicate if the given media type is supported
+   * @param mediaType Media type
+   */
+  supports(mediaType: string): boolean;
+  /**
+   * Parse the request body
+   * @param request http request
+   */
+  parse(request: Request): Promise<RequestBody>;
+}
+
+/**
+ * Binding tag for request body parser extensions
+ */
+export const REQUEST_BODY_PARSER_TAG = 'rest.requestBodyParser';
+
 export class RequestBodyParser {
+  private parsers: BodyParser[];
   private jsonParser: BodyParserWithCallback;
   private urlencodedParser: BodyParserWithCallback;
   private textParser: BodyParserWithCallback;
@@ -110,6 +136,8 @@ export class RequestBodyParser {
   constructor(
     @inject(RestBindings.REQUEST_BODY_PARSER_OPTIONS, {optional: true})
     options: RequestBodyParserOptions = {},
+    @inject.tag(REQUEST_BODY_PARSER_TAG, {optional: true})
+    parsers: BodyParser[] = [],
   ) {
     const jsonOptions = Object.assign(
       {type: 'json', limit: DEFAULT_LIMIT},
@@ -132,33 +160,39 @@ export class RequestBodyParser {
       getParserOptions('text', options),
     );
     this.textParser = text(textOptions);
+
+    this.parsers = parsers.concat([
+      {
+        name: 'json',
+        supports: mediaType => !!is(mediaType, 'json'),
+        parse: request => this.parseJsonBody(request),
+      },
+      {
+        name: 'urlencoded',
+        supports: mediaType => !!is(mediaType, 'urlencoded'),
+        parse: request => this.parseUrlencodedBody(request),
+      },
+      {
+        name: 'text',
+        supports: mediaType => !!is(mediaType, 'text/*'),
+        parse: request => this.parseTextBody(request),
+      },
+    ]);
   }
 
-  async parseJsonBody(request: Request, mediaType: string = 'json') {
-    if (is(mediaType, 'json')) {
-      await parse(this.jsonParser, request);
-      return {value: request.body};
-    }
-    return undefined;
+  async parseJsonBody(request: Request) {
+    await parse(this.jsonParser, request);
+    return {value: request.body};
   }
 
-  async parseUrlencodedBody(
-    request: Request,
-    mediaType: string = 'urlencoded',
-  ) {
-    if (is(mediaType, 'urlencoded')) {
-      await parse(this.urlencodedParser, request);
-      return {value: request.body, coercionRequired: true};
-    }
-    return undefined;
+  async parseUrlencodedBody(request: Request) {
+    await parse(this.urlencodedParser, request);
+    return {value: request.body, coercionRequired: true};
   }
 
-  async parseTextBody(request: Request, mediaType: string = 'text/*') {
-    if (is(mediaType, 'text/*')) {
-      await parse(this.textParser, request);
-      return {value: request.body};
-    }
-    return undefined;
+  async parseTextBody(request: Request) {
+    await parse(this.textParser, request);
+    return {value: request.body};
   }
 
   private normalizeParsingError(err: HttpError) {
@@ -205,6 +239,7 @@ export class RequestBodyParser {
     for (const type in content) {
       matchedMediaType = is(contentType, type);
       if (matchedMediaType) {
+        debug('Matched media type: %s -> %s', type, contentType);
         requestBody.mediaType = type;
         requestBody.schema = content[type].schema;
         break;
@@ -219,12 +254,23 @@ export class RequestBodyParser {
     }
 
     try {
-      let body = await this.parseJsonBody(request, matchedMediaType);
-      if (body !== undefined) return Object.assign(requestBody, body);
-      body = await this.parseUrlencodedBody(request, matchedMediaType);
-      if (body !== undefined) return Object.assign(requestBody, body);
-      body = await this.parseTextBody(request, matchedMediaType);
-      if (body !== undefined) return Object.assign(requestBody, body);
+      for (const parser of this.parsers) {
+        if (!parser.supports(matchedMediaType)) {
+          debug(
+            'Body parser %s does not support %s',
+            parser.name || (parser.constructor && parser.constructor.name),
+            matchedMediaType,
+          );
+          continue;
+        }
+        debug(
+          'Body parser %s found for %s',
+          parser.name || (parser.constructor && parser.constructor.name),
+          matchedMediaType,
+        );
+        const body = await parser.parse(request);
+        return Object.assign(requestBody, body);
+      }
     } catch (err) {
       throw this.normalizeParsingError(err);
     }
